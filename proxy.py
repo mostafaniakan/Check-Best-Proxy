@@ -1,0 +1,354 @@
+#!/usr/bin/env python3
+
+import requests
+import json
+import os
+import sys
+import time
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+import warnings
+
+# Suppress SSL warnings (since we intentionally disable SSL verification for some tests)
+requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
+
+OUTPUT_FILE = "workProxy.txt"
+SLOW_PROXY_FILE = "slowProxy.txt"
+FAILED_PROXY_FILE = "failedProxy.txt"
+
+# Test URLs with different protocols for better compatibility
+TEST_URLS = [
+    ("http://httpbin.org/ip", True),  # (url, verify_ssl)
+    ("https://httpbin.org/ip", False),  # SSL disabled for problematic proxies
+    ("http://api.ipify.org?format=json", True),
+    ("https://api.ipify.org?format=json", False),
+    ("https://ip.me/", False),  # Real website test - SSL disabled (many proxies fail this)
+]
+
+# Performance settings
+FAST_TIMEOUT = 3  # seconds - for fast proxies
+SLOW_THRESHOLD = 5  # seconds - proxies taking longer are marked as slow
+VERY_SLOW_THRESHOLD = 8  # seconds - proxies taking this long are marked as very slow
+
+# ⚙️ Filter Setting: Only save proxies faster than this
+MAX_ACCEPTABLE_TIME = 3  # seconds - Only save proxies faster than this threshold
+# Settings options:
+# MAX_ACCEPTABLE_TIME = 3   → Only [OK-FAST] proxies
+# MAX_ACCEPTABLE_TIME = 5   → [OK-FAST] and [OK-NORMAL]
+# MAX_ACCEPTABLE_TIME = 8   → [OK-FAST], [OK-NORMAL], [OK-SLOW]
+# MAX_ACCEPTABLE_TIME = 100 → All working proxies
+
+# Lock for thread-safe printing
+print_lock = threading.Lock()
+
+def select_file_type():
+    """Let user choose between JSON and text file"""
+    print("\n" + "="*50)
+    print("Choose input file type:")
+    print("="*50)
+    print("[1] JSON file (proxies.json)")
+    print("[2] Text file (proxies.txt)")
+    print("[3] Custom file path")
+    print("="*50)
+
+    while True:
+        choice = input("Enter your choice (1-3): ").strip()
+
+        # Handle choice 1
+        if choice in ["1", "one"]:
+            if os.path.exists("proxies.json"):
+                return "proxies.json"
+            else:
+                print("[ERROR] proxies.json not found in current directory")
+                print("Create proxies.json first")
+                return None
+
+        # Handle choice 2
+        elif choice in ["2", "two"]:
+            if os.path.exists("proxies.txt"):
+                return "proxies.txt"
+            else:
+                print("[ERROR] proxies.txt not found in current directory")
+                print("Create proxies.txt first")
+                return None
+
+        # Handle choice 3
+        elif choice in ["3", "three"]:
+            file_path = input("Enter file path: ").strip()
+            if os.path.exists(file_path):
+                return file_path
+            else:
+                print(f"[ERROR] File '{file_path}' not found")
+                return None
+
+        # Invalid choice
+        else:
+            print(f"[ERROR] Invalid choice '{choice}'. Enter 1, 2, or 3")
+
+def load_proxies_from_file(file_path):
+    """Load proxies from JSON or text file"""
+    if not os.path.exists(file_path):
+        print(f"[ERROR] File '{file_path}' not found")
+        return []
+
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            content = f.read().strip()
+
+        # Try to load as JSON
+        if file_path.endswith(".json"):
+            data = json.loads(content)
+            if isinstance(data, list):
+                return [str(p).strip() for p in data if p]
+            elif isinstance(data, dict) and "proxies" in data:
+                return [str(p).strip() for p in data["proxies"] if p]
+            else:
+                print("[ERROR] Invalid JSON format. Expected: ['proxy1', 'proxy2'] or {'proxies': ['proxy1', ...]}")
+                return []
+        else:
+            # Text file
+            return [line.strip() for line in content.split("\n") if line.strip()]
+
+    except json.JSONDecodeError as e:
+        print(f"[ERROR] Failed to read JSON: {e}")
+        return []
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        return []
+
+def check_proxy(proxy):
+     """Check if proxy is working, return (is_working, response_time, error_type)"""
+     import time
+
+     # proxy format can be "ip:port"
+     if "://" not in proxy:
+         proxy_url = f"http://{proxy}"
+     else:
+         proxy_url = proxy
+
+     proxies = {
+         "http": proxy_url,
+         "https": proxy_url,
+     }
+
+     fastest_time = None
+     ssl_errors = []
+     https_working = False
+     ip_me_working = False
+
+     for test_url, verify_ssl in TEST_URLS:
+         try:
+             start_time = time.time()
+
+             response = requests.get(
+                 test_url,
+                 proxies=proxies,
+                 timeout=SLOW_THRESHOLD,
+                 allow_redirects=False,
+                 verify=verify_ssl  # Key change: handle SSL verification
+             )
+
+             elapsed_time = time.time() - start_time
+
+             if response.status_code in [200, 301, 302]:
+                 # Track if HTTPS works
+                 if test_url.startswith("https://"):
+                     https_working = True
+
+                 # Track if ip.me works
+                 if "ip.me" in test_url:
+                     ip_me_working = True
+
+                 if fastest_time is None or elapsed_time < fastest_time:
+                     fastest_time = elapsed_time
+
+         except requests.exceptions.SSLError as e:
+             ssl_errors.append(str(e))
+             continue
+
+         except requests.exceptions.Timeout:
+             continue
+
+         except (requests.exceptions.ProxyError,
+                 requests.exceptions.ConnectionError):
+             continue
+
+         except requests.exceptions.RequestException as e:
+             continue
+
+         except Exception:
+             continue
+
+     # Check if proxy meets requirements: must work with HTTPS AND ip.me
+     if https_working and ip_me_working and fastest_time is not None:
+         return (True, fastest_time, "OK")
+     elif not https_working:
+         return (False, None, "NO_HTTPS")
+     elif not ip_me_working:
+         return (False, None, "NO_IP_ME")
+     elif ssl_errors and not fastest_time:
+         return (False, None, "SSL_ERROR")
+     else:
+         return (False, fastest_time, "FAILED")
+
+def safe_print(message):
+    """Thread-safe printing"""
+    with print_lock:
+        print(message)
+
+def save_proxy_immediately(proxy):
+    """Save good proxy to file immediately"""
+    with print_lock:
+        try:
+            with open(OUTPUT_FILE, "a", encoding="utf-8") as out:
+                out.write(proxy + "\n")
+        except Exception as e:
+            pass
+
+def test_proxy_worker(proxy, index, total):
+     """Worker function for thread pool"""
+     is_working, response_time, error_type = check_proxy(proxy)
+
+     if is_working:
+         if response_time < FAST_TIMEOUT:
+             status = "[OK-FAST]"
+         elif response_time < SLOW_THRESHOLD:
+             status = "[OK-NORMAL]"
+         elif response_time < VERY_SLOW_THRESHOLD:
+             status = "[OK-SLOW]"
+         else:
+             status = "[OK-VERY_SLOW]"
+         time_str = f" ({response_time:.2f}s)" if response_time else ""
+         safe_print(f"[{index}/{total}] {status} {proxy}{time_str}")
+
+         # Save proxy immediately if it meets speed requirement
+         if response_time <= MAX_ACCEPTABLE_TIME:
+             save_proxy_immediately(proxy)
+     else:
+         if error_type == "SSL_ERROR":
+             status = "[FAILED-SSL]"
+         elif error_type == "NO_HTTPS":
+             status = "[FAILED-NO_HTTPS]"
+         elif error_type == "NO_IP_ME":
+             status = "[FAILED-NO_IP_ME]"
+         else:
+             status = "[FAILED]"
+         safe_print(f"[{index}/{total}] {status} {proxy}")
+
+     return (proxy, is_working, response_time, error_type)
+
+def main():
+    # Get file path from argument or let user choose
+    if len(sys.argv) > 1:
+        input_file = sys.argv[1]
+    else:
+        input_file = select_file_type()
+        if not input_file:
+            print("[ERROR] No file selected. Exiting...")
+            return
+
+    # Clear output file at start
+    try:
+        open(OUTPUT_FILE, "w", encoding="utf-8").close()
+    except Exception:
+        pass
+
+    print(f"\n[INFO] Reading file: {input_file}")
+    proxy_list = load_proxies_from_file(input_file)
+
+    if not proxy_list:
+        print("[ERROR] No proxies found!")
+        return
+
+    print(f"[INFO] Total proxies: {len(proxy_list)}")
+    print(f"[INFO] Saving good proxies to '{OUTPUT_FILE}' instantly...\n")
+
+    working_proxies = []
+    slow_proxies = []
+    failed_proxies = []
+
+    # Use ThreadPoolExecutor for parallel testing
+    max_workers = min(10, len(proxy_list))  # Max 10 threads
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(test_proxy_worker, proxy, i+1, len(proxy_list)): proxy
+            for i, proxy in enumerate(proxy_list)
+        }
+
+        for future in as_completed(futures):
+            proxy, is_working, response_time, error_type = future.result()
+
+            if is_working:
+                working_proxies.append((proxy, response_time))
+                if response_time >= SLOW_THRESHOLD:
+                    slow_proxies.append((proxy, response_time))
+            else:
+                failed_proxies.append((proxy, error_type))
+
+    # Show summary
+    print("\n" + "="*60)
+
+    if working_proxies:
+        # Categorize proxies by speed
+        fast_proxies = [(p, t) for p, t in working_proxies if t < FAST_TIMEOUT]
+        normal_proxies = [(p, t) for p, t in working_proxies if FAST_TIMEOUT <= t < SLOW_THRESHOLD]
+        slow_proxies_list = [(p, t) for p, t in working_proxies if t >= SLOW_THRESHOLD]
+
+        # Filter: Only count proxies faster than MAX_ACCEPTABLE_TIME
+        filtered_proxies = [(p, t) for p, t in working_proxies if t <= MAX_ACCEPTABLE_TIME]
+
+        print(f"✅ [SUCCESS] Good proxies saved to '{OUTPUT_FILE}' instantly!")
+        print(f"   - Saved proxies (≤ {MAX_ACCEPTABLE_TIME}s): {len(filtered_proxies)}")
+        print(f"\n📊 All proxies breakdown:")
+        print(f"   - Fast proxies (< {FAST_TIMEOUT}s): {len(fast_proxies)}")
+        print(f"   - Normal proxies ({FAST_TIMEOUT}s - {SLOW_THRESHOLD}s): {len(normal_proxies)}")
+        print(f"   - Slow proxies (≥ {SLOW_THRESHOLD}s): {len(slow_proxies_list)}")
+        print(f"   - Total working: {len(working_proxies)}/{len(proxy_list)}")
+    else:
+        print(f"⚠️  [WARNING] No working proxies found!")
+        print(f"   Failed: {len(failed_proxies)}")
+        print(f"   SSL Errors: {len([p for p, e in failed_proxies if e == 'SSL_ERROR'])}")
+
+    # Show failure breakdown
+    ssl_failed = [(p, e) for p, e in failed_proxies if e == "SSL_ERROR"]
+    no_https = [(p, e) for p, e in failed_proxies if e == "NO_HTTPS"]
+    no_ip_me = [(p, e) for p, e in failed_proxies if e == "NO_IP_ME"]
+    other_failed = [(p, e) for p, e in failed_proxies if e not in ["SSL_ERROR", "NO_HTTPS", "NO_IP_ME"]]
+
+    if failed_proxies:
+        print(f"\n📊 Failed proxies breakdown:")
+        print(f"   - No HTTPS support: {len(no_https)}")
+        print(f"   - Can't access ip.me: {len(no_ip_me)}")
+        if ssl_failed:
+            print(f"   - SSL certificate errors: {len(ssl_failed)}")
+        if other_failed:
+            print(f"   - Other failures: {len(other_failed)}")
+
+    if no_https:
+        print(f"\n⚠️  [{len(no_https)}] Proxies without HTTPS support (ignored):")
+        for proxy, _ in no_https[:5]:  # Show first 5
+            print(f"   - {proxy}")
+        if len(no_https) > 5:
+            print(f"   ... and {len(no_https) - 5} more")
+
+    if no_ip_me:
+        print(f"\n⚠️  [{len(no_ip_me)}] Proxies that can't access ip.me (ignored):")
+        for proxy, _ in no_ip_me[:5]:  # Show first 5
+            print(f"   - {proxy}")
+        if len(no_ip_me) > 5:
+            print(f"   ... and {len(no_ip_me) - 5} more")
+
+    if ssl_failed:
+        print(f"\n⚠️  [{len(ssl_failed)}] Proxies with SSL certificate errors:")
+        print("   These might work with: curl, Firefox, or chrome --no-default-browser-check")
+        for proxy, _ in ssl_failed[:5]:  # Show first 5
+            print(f"   - {proxy}")
+        if len(ssl_failed) > 5:
+            print(f"   ... and {len(ssl_failed) - 5} more")
+
+    print("="*60 + "\n")
+
+if __name__ == "__main__":
+    main()

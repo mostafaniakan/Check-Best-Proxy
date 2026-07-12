@@ -23,7 +23,8 @@ TEST_URLS = [
     ("https://httpbin.org/ip", False),  # SSL disabled for problematic proxies
     ("http://api.ipify.org?format=json", True),
     ("https://api.ipify.org?format=json", False),
-    ("https://ip.me/", False),  # Real website test - SSL disabled (many proxies fail this)
+    ("https://ip.me/", False), # Real website test - SSL disabled (many proxies fail this)
+    ("https://api.digikala.com/fresh/v1/product/2963408/", False),  # Real website test - SSL disabled
 ]
 
 # Performance settings

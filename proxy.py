@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import argparse
 import requests
 import json
 import os
@@ -28,6 +29,7 @@ TEST_URLS = [
 ]
 
 # Performance settings
+DEFAULT_MAX_WORKERS = 10
 FAST_TIMEOUT = 3  # seconds - for fast proxies
 SLOW_THRESHOLD = 5  # seconds - proxies taking longer are marked as slow
 VERY_SLOW_THRESHOLD = 8  # seconds - proxies taking this long are marked as very slow
@@ -86,6 +88,23 @@ def select_file_type():
         # Invalid choice
         else:
             print(f"[ERROR] Invalid choice '{choice}'. Enter 1, 2, or 3")
+
+def parse_args():
+    """Parse command-line arguments."""
+    parser = argparse.ArgumentParser(description="Fast parallel proxy checker")
+    parser.add_argument(
+        "input_file",
+        nargs="?",
+        help="Proxy file path (JSON or text). If omitted, an interactive menu is shown.",
+    )
+    parser.add_argument(
+        "-w",
+        "--workers",
+        type=int,
+        default=DEFAULT_MAX_WORKERS,
+        help=f"Number of parallel worker threads (default: {DEFAULT_MAX_WORKERS})",
+    )
+    return parser.parse_args()
 
 def load_proxies_from_file(file_path):
     """Load proxies from JSON or text file"""
@@ -240,9 +259,12 @@ def test_proxy_worker(proxy, index, total):
      return (proxy, is_working, response_time, error_type)
 
 def main():
+    args = parse_args()
+    worker_count = max(1, args.workers)
+
     # Get file path from argument or let user choose
-    if len(sys.argv) > 1:
-        input_file = sys.argv[1]
+    if args.input_file:
+        input_file = args.input_file
     else:
         input_file = select_file_type()
         if not input_file:
@@ -263,6 +285,7 @@ def main():
         return
 
     print(f"[INFO] Total proxies: {len(proxy_list)}")
+    print(f"[INFO] Using up to {worker_count} worker threads")
     print(f"[INFO] Saving good proxies to '{OUTPUT_FILE}' instantly...\n")
 
     working_proxies = []
@@ -270,7 +293,7 @@ def main():
     failed_proxies = []
 
     # Use ThreadPoolExecutor for parallel testing
-    max_workers = min(10, len(proxy_list))  # Max 10 threads
+    max_workers = min(worker_count, len(proxy_list))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {

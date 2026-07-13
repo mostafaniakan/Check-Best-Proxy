@@ -3,7 +3,7 @@
 A fast, parallel proxy checking program that verifies if proxies are working properly
 
 ## Features
-✅ **Parallel testing** - Tests up to 10 proxies simultaneously (much faster!)
+✅ **Parallel testing** - Tests proxies simultaneously with configurable worker count
 ✅ **SSL Certificate Handling** - Disables SSL verification for problematic proxies
 ✅ **HTTP Fallback** - Tests with both HTTP and HTTPS URLs
 ✅ **Speed Detection** - Identifies fast, normal, and slow proxies
@@ -49,6 +49,12 @@ Pass the file path as an argument:
 python3 proxy.py proxies.txt
 python3 proxy.py proxies.json
 python3 proxy.py /path/to/your/proxies.json
+```
+
+You can also choose the number of worker threads:
+```bash
+python3 proxy.py proxies.txt --workers 20
+python3 proxy.py proxies.json -w 32
 ```
 
 ### Method 3: Direct Execution
@@ -106,20 +112,20 @@ Console output shows:
 ## Performance
 
 ### What Makes It Fast?
-1. **Parallel Testing** - Tests multiple proxies at once (up to 10 concurrent connections)
+1. **Parallel Testing** - Tests multiple proxies at once with a configurable worker pool
 2. **Optimized URLs** - Uses fast, lightweight test endpoints
 3. **Short Timeouts** - 5 second timeout per test (vs 10+ seconds for others)
 4. **Efficient HTTP** - No redirect following to save time
 
 ### Speed Comparison
 - **Old way** (sequential): 100 proxies × 5 seconds = ~500+ seconds
-- **New way** (parallel 10 at a time): 100 proxies ÷ 10 × 5 seconds = ~50 seconds ⚡
+- **New way** (parallel with workers): 100 proxies ÷ 10 × 5 seconds = ~50 seconds ⚡
 
 ## Settings
 
 | Setting | Value | Reason |
 |---------|-------|--------|
-| Max Workers | 10 | Balance between speed and system load |
+| Max Workers | 10 by default | Balance between speed and system load; override with `--workers` |
 | Fast Timeout | 3 seconds | Identify fast proxies |
 | Slow Threshold | 5 seconds | Proxies slower than this are marked as slow |
 | Very Slow Threshold | 8 seconds | Proxies slower than this are marked as very slow |
@@ -157,7 +163,7 @@ Console output shows:
 
 1. Choose or specify a proxy file (JSON or text)
 2. Program reads all proxies from the file
-3. Tests proxies in parallel against fast URLs with both HTTP and HTTPS:
+3. Tests proxies in parallel against fast URLs with both HTTP and HTTPS using the configured worker count:
    - http://httpbin.org/ip (with SSL verification)
    - https://httpbin.org/ip (SSL verification disabled)
    - http://api.ipify.org?format=json (with SSL verification)
@@ -167,5 +173,3 @@ Console output shows:
 6. Working proxies are saved to `workProxy.txt`
 7. Non-working proxies are ignored (but SSL errors are reported separately)
 8. Tests continue until all proxies are checked
-
-

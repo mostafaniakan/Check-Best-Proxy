@@ -4,6 +4,7 @@ A fast, parallel proxy checking program that verifies if proxies are working pro
 
 ## Features
 ✅ **Parallel testing** - Tests proxies simultaneously with configurable worker count
+✅ **HTTP, SOCKS4, SOCKS5 support** - Works with explicit schemes or auto-detected `ip:port` entries
 ✅ **SSL Certificate Handling** - Disables SSL verification for problematic proxies
 ✅ **HTTP Fallback** - Tests with both HTTP and HTTPS URLs
 ✅ **Speed Detection** - Identifies fast, normal, and slow proxies
@@ -56,6 +57,16 @@ You can also choose the number of worker threads:
 python3 proxy.py proxies.txt --workers 20
 python3 proxy.py proxies.json -w 32
 ```
+
+Supported input styles:
+```text
+70.166.65.160:4145
+http://144.124.227.88:3129
+socks4://138.124.106.230:443
+socks5://194.59.186.35:1080
+```
+
+If a proxy is given as plain `ip:port`, the checker guesses the protocol order and stores the working normalized proxy URL in `workProxy.txt`.
 
 ### Method 3: Direct Execution
 ```bash
@@ -116,6 +127,7 @@ Console output shows:
 2. **Optimized URLs** - Uses fast, lightweight test endpoints
 3. **Short Timeouts** - 5 second timeout per test (vs 10+ seconds for others)
 4. **Efficient HTTP** - No redirect following to save time
+5. **Protocol Auto-Detection** - Plain `ip:port` entries are probed as HTTP or SOCKS depending on the port and working result
 
 ### Speed Comparison
 - **Old way** (sequential): 100 proxies × 5 seconds = ~500+ seconds
@@ -129,6 +141,7 @@ Console output shows:
 | Fast Timeout | 3 seconds | Identify fast proxies |
 | Slow Threshold | 5 seconds | Proxies slower than this are marked as slow |
 | Very Slow Threshold | 8 seconds | Proxies slower than this are marked as very slow |
+| Proxy Request Timeout | 1s connect / 2s read | Fail faster on dead or slow proxies |
 | SSL Verification | Disabled for some tests | Handle proxies with certificate issues |
 
 ## Output Indicators

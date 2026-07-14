@@ -1,15 +1,22 @@
 #!/usr/bin/env python3
 
 import argparse
-import requests
 import json
 import os
 import sys
 import time
-from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 import warnings
+from urllib.parse import urlsplit
+
+# Suppress noisy urllib3/OpenSSL environment warnings before importing requests.
+warnings.filterwarnings(
+    "ignore",
+    message="urllib3 v2 only supports OpenSSL.*",
+)
+
+import requests
 
 # Suppress SSL warnings (since we intentionally disable SSL verification for some tests)
 requests.packages.urllib3.disable_warnings(requests.packages.urllib3.exceptions.InsecureRequestWarning)
@@ -33,6 +40,9 @@ DEFAULT_MAX_WORKERS = 10
 FAST_TIMEOUT = 3  # seconds - for fast proxies
 SLOW_THRESHOLD = 5  # seconds - proxies taking longer are marked as slow
 VERY_SLOW_THRESHOLD = 8  # seconds - proxies taking this long are marked as very slow
+PROXY_CONNECT_TIMEOUT = 1.0  # seconds - fail fast on dead/slow connections
+PROXY_READ_TIMEOUT = 2.0  # seconds - keep the per-request wait short
+PROXY_REQUEST_TIMEOUT = (PROXY_CONNECT_TIMEOUT, PROXY_READ_TIMEOUT)
 
 # ⚙️ Filter Setting: Only save proxies faster than this
 MAX_ACCEPTABLE_TIME = 3  # seconds - Only save proxies faster than this threshold
@@ -44,6 +54,11 @@ MAX_ACCEPTABLE_TIME = 3  # seconds - Only save proxies faster than this threshol
 
 # Lock for thread-safe printing
 print_lock = threading.Lock()
+
+COMMON_SOCKS_PORTS = {
+    1080, 1081, 1085, 1090, 1091, 1092, 1093, 1094, 1095, 1096,
+    4145, 4444, 9050, 9150,
+}
 
 def select_file_type():
     """Let user choose between JSON and text file"""
@@ -137,80 +152,140 @@ def load_proxies_from_file(file_path):
         print(f"[ERROR] {e}")
         return []
 
+def split_proxy_target(proxy):
+    """Split a proxy string into scheme and host:port target."""
+    proxy = proxy.strip()
+    if "://" in proxy:
+        parsed = urlsplit(proxy)
+        if not parsed.scheme or not parsed.netloc:
+            return None, None
+        return parsed.scheme.lower(), parsed.netloc
+    return None, proxy
+
+def guess_proxy_candidates(proxy):
+    """Return proxy URLs to try, ordered by the best guess first."""
+    scheme, target = split_proxy_target(proxy)
+    if not target:
+        return []
+
+    if scheme:
+        return [f"{scheme}://{target}"]
+
+    host, sep, port_text = target.rpartition(":")
+    if not sep or not host or not port_text.isdigit():
+        return [f"http://{target}"]
+
+    port = int(port_text)
+    if port in COMMON_SOCKS_PORTS:
+        return [
+            f"socks5://{target}",
+            f"socks4://{target}",
+            f"http://{target}",
+        ]
+
+    return [
+        f"http://{target}",
+        f"socks5://{target}",
+        f"socks4://{target}",
+    ]
+
 def check_proxy(proxy):
-     """Check if proxy is working, return (is_working, response_time, error_type)"""
-     import time
+     """Check if proxy is working, return (is_working, response_time, error_type, resolved_proxy)."""
+     candidates = guess_proxy_candidates(proxy)
+     if not candidates:
+         return (False, None, "INVALID", None)
 
-     # proxy format can be "ip:port"
-     if "://" not in proxy:
-         proxy_url = f"http://{proxy}"
-     else:
-         proxy_url = proxy
+     last_error_type = "FAILED"
+     last_fastest_time = None
+     last_schema_error = None
 
-     proxies = {
-         "http": proxy_url,
-         "https": proxy_url,
-     }
+     for proxy_url in candidates:
+         proxies = {
+             "http": proxy_url,
+             "https": proxy_url,
+         }
 
-     fastest_time = None
-     ssl_errors = []
-     https_working = False
-     ip_me_working = False
+         fastest_time = None
+         ssl_errors = []
+         https_working = False
+         ip_me_working = False
+         candidate_schema_error = None
 
-     for test_url, verify_ssl in TEST_URLS:
-         try:
-             start_time = time.time()
+         for test_url, verify_ssl in TEST_URLS:
+             try:
+                 start_time = time.time()
 
-             response = requests.get(
-                 test_url,
-                 proxies=proxies,
-                 timeout=SLOW_THRESHOLD,
-                 allow_redirects=False,
-                 verify=verify_ssl  # Key change: handle SSL verification
-             )
+                 response = requests.get(
+                     test_url,
+                     proxies=proxies,
+                     timeout=PROXY_REQUEST_TIMEOUT,
+                     allow_redirects=False,
+                     verify=verify_ssl  # Key change: handle SSL verification
+                 )
 
-             elapsed_time = time.time() - start_time
+                 elapsed_time = time.time() - start_time
 
-             if response.status_code in [200, 301, 302]:
-                 # Track if HTTPS works
-                 if test_url.startswith("https://"):
-                     https_working = True
+                 if response.status_code in [200, 301, 302]:
+                     # Track if HTTPS works
+                     if test_url.startswith("https://"):
+                         https_working = True
 
-                 # Track if ip.me works
-                 if "ip.me" in test_url:
-                     ip_me_working = True
+                     # Track if ip.me works
+                     if "ip.me" in test_url:
+                         ip_me_working = True
 
-                 if fastest_time is None or elapsed_time < fastest_time:
-                     fastest_time = elapsed_time
+                     if fastest_time is None or elapsed_time < fastest_time:
+                         fastest_time = elapsed_time
 
-         except requests.exceptions.SSLError as e:
-             ssl_errors.append(str(e))
+             except requests.exceptions.SSLError as e:
+                 ssl_errors.append(str(e))
+                 continue
+
+             except requests.exceptions.InvalidSchema as e:
+                 error_text = str(e).lower()
+                 if "socks" in error_text:
+                     candidate_schema_error = "SOCKS_MISSING"
+                 else:
+                     candidate_schema_error = "INVALID"
+                 break
+
+             except requests.exceptions.Timeout:
+                 continue
+
+             except (requests.exceptions.ProxyError,
+                     requests.exceptions.ConnectionError):
+                 continue
+
+             except requests.exceptions.RequestException:
+                 continue
+
+             except Exception:
+                 continue
+
+         if candidate_schema_error:
+             last_schema_error = candidate_schema_error
              continue
 
-         except requests.exceptions.Timeout:
-             continue
+         # Check if proxy meets requirements: must work with HTTPS AND ip.me
+         if https_working and ip_me_working and fastest_time is not None:
+             return (True, fastest_time, "OK", proxy_url)
 
-         except (requests.exceptions.ProxyError,
-                 requests.exceptions.ConnectionError):
-             continue
+         if not https_working:
+             last_error_type = "NO_HTTPS"
+         elif not ip_me_working:
+             last_error_type = "NO_IP_ME"
+         elif ssl_errors and not fastest_time:
+             last_error_type = "SSL_ERROR"
+         else:
+             last_error_type = "FAILED"
 
-         except requests.exceptions.RequestException as e:
-             continue
+         if fastest_time is not None:
+             last_fastest_time = fastest_time
 
-         except Exception:
-             continue
+     if last_schema_error:
+         last_error_type = last_schema_error
 
-     # Check if proxy meets requirements: must work with HTTPS AND ip.me
-     if https_working and ip_me_working and fastest_time is not None:
-         return (True, fastest_time, "OK")
-     elif not https_working:
-         return (False, None, "NO_HTTPS")
-     elif not ip_me_working:
-         return (False, None, "NO_IP_ME")
-     elif ssl_errors and not fastest_time:
-         return (False, None, "SSL_ERROR")
-     else:
-         return (False, fastest_time, "FAILED")
+     return (False, last_fastest_time, last_error_type, None)
 
 def safe_print(message):
     """Thread-safe printing"""
@@ -228,7 +303,8 @@ def save_proxy_immediately(proxy):
 
 def test_proxy_worker(proxy, index, total):
      """Worker function for thread pool"""
-     is_working, response_time, error_type = check_proxy(proxy)
+     is_working, response_time, error_type, resolved_proxy = check_proxy(proxy)
+     display_proxy = resolved_proxy or proxy
 
      if is_working:
          if response_time < FAST_TIMEOUT:
@@ -240,11 +316,11 @@ def test_proxy_worker(proxy, index, total):
          else:
              status = "[OK-VERY_SLOW]"
          time_str = f" ({response_time:.2f}s)" if response_time else ""
-         safe_print(f"[{index}/{total}] {status} {proxy}{time_str}")
+         safe_print(f"[{index}/{total}] {status} {display_proxy}{time_str}")
 
          # Save proxy immediately if it meets speed requirement
          if response_time <= MAX_ACCEPTABLE_TIME:
-             save_proxy_immediately(proxy)
+             save_proxy_immediately(display_proxy)
      else:
          if error_type == "SSL_ERROR":
              status = "[FAILED-SSL]"
@@ -252,11 +328,15 @@ def test_proxy_worker(proxy, index, total):
              status = "[FAILED-NO_HTTPS]"
          elif error_type == "NO_IP_ME":
              status = "[FAILED-NO_IP_ME]"
+         elif error_type == "SOCKS_MISSING":
+             status = "[FAILED-SOCKS_DEP]"
+         elif error_type == "INVALID":
+             status = "[FAILED-INVALID]"
          else:
              status = "[FAILED]"
-         safe_print(f"[{index}/{total}] {status} {proxy}")
+         safe_print(f"[{index}/{total}] {status} {display_proxy}")
 
-     return (proxy, is_working, response_time, error_type)
+     return (display_proxy, is_working, response_time, error_type)
 
 def main():
     args = parse_args()
@@ -288,17 +368,18 @@ def main():
     print(f"[INFO] Using up to {worker_count} worker threads")
     print(f"[INFO] Saving good proxies to '{OUTPUT_FILE}' instantly...\n")
 
+    worker_list = proxy_list
     working_proxies = []
     slow_proxies = []
     failed_proxies = []
 
     # Use ThreadPoolExecutor for parallel testing
-    max_workers = min(worker_count, len(proxy_list))
+    max_workers = min(worker_count, len(worker_list))
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         futures = {
-            executor.submit(test_proxy_worker, proxy, i+1, len(proxy_list)): proxy
-            for i, proxy in enumerate(proxy_list)
+            executor.submit(test_proxy_worker, proxy, i+1, len(worker_list)): proxy
+            for i, proxy in enumerate(worker_list)
         }
 
         for future in as_completed(futures):
@@ -339,12 +420,15 @@ def main():
     ssl_failed = [(p, e) for p, e in failed_proxies if e == "SSL_ERROR"]
     no_https = [(p, e) for p, e in failed_proxies if e == "NO_HTTPS"]
     no_ip_me = [(p, e) for p, e in failed_proxies if e == "NO_IP_ME"]
-    other_failed = [(p, e) for p, e in failed_proxies if e not in ["SSL_ERROR", "NO_HTTPS", "NO_IP_ME"]]
+    socks_missing = [(p, e) for p, e in failed_proxies if e == "SOCKS_MISSING"]
+    other_failed = [(p, e) for p, e in failed_proxies if e not in ["SSL_ERROR", "NO_HTTPS", "NO_IP_ME", "SOCKS_MISSING", "INVALID"]]
 
     if failed_proxies:
         print(f"\n📊 Failed proxies breakdown:")
         print(f"   - No HTTPS support: {len(no_https)}")
         print(f"   - Can't access ip.me: {len(no_ip_me)}")
+        if socks_missing:
+            print(f"   - SOCKS dependency missing: {len(socks_missing)}")
         if ssl_failed:
             print(f"   - SSL certificate errors: {len(ssl_failed)}")
         if other_failed:
@@ -363,6 +447,14 @@ def main():
             print(f"   - {proxy}")
         if len(no_ip_me) > 5:
             print(f"   ... and {len(no_ip_me) - 5} more")
+
+    if socks_missing:
+        print(f"\n⚠️  [{len(socks_missing)}] SOCKS proxies could not be tested because PySocks is missing:")
+        print("   Install dependencies with: pip3 install -r requirements.txt")
+        for proxy, _ in socks_missing[:5]:
+            print(f"   - {proxy}")
+        if len(socks_missing) > 5:
+            print(f"   ... and {len(socks_missing) - 5} more")
 
     if ssl_failed:
         print(f"\n⚠️  [{len(ssl_failed)}] Proxies with SSL certificate errors:")
